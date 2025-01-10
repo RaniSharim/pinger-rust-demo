@@ -1,11 +1,14 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use rand::Rng;
 use tokio::signal;
 use tokio_icmp_echo::Pinger;
+use futures::StreamExt;
+use futures::stream::{FuturesUnordered};
+use futures::future::BoxFuture;
+
+type PingResult = (String, Pinger);
 
 #[derive(Debug)]
 struct LatencyStats {
@@ -30,18 +33,9 @@ impl LatencyStats {
     }
 }
 
-
-
 async fn ping_host(pinger: &Pinger, host: &str) -> Option<Duration> {
-    // Send an ICMP echo request and wait for a reply
-    // eprintln!("pinging: {}", host);
-
     match pinger.ping(host.parse().ok()?, 0xabcd, 0, Duration::from_millis(250)).await {
-        Ok(reply) => {
-            // eprintln!("Pinged: {}", host);
-            // note : on timeout we get None here
-           reply
-        }
+        Ok(reply) => reply,
         Err(_) => {
             eprintln!("Failed to ping host: {}", host);
             None
@@ -49,50 +43,55 @@ async fn ping_host(pinger: &Pinger, host: &str) -> Option<Duration> {
     }
 }
 
-async fn monitor_host(host: String, stats: Arc<Mutex<HashMap<String, LatencyStats>>>) {
-    let pinger = Pinger::new().await.unwrap();
-    eprintln!("starting: {}", host);
-
-    // Wait a random amount of time between 0-500ms before pinging
-    let delay = rand::thread_rng().gen_range(0..500);
-    sleep(Duration::from_millis(delay)).await;
-
-    loop {
-       
-         // Ping the host and measure latency
-         if let Some(latency) = ping_host(&pinger, &host).await {
-            // Update the latency statistics
-            let mut stats = stats.lock().await;
-            let entry = stats.entry(host.clone()).or_insert_with(LatencyStats::new);
-            
-            entry.update(latency.as_millis());
-
-            println!(
-                "Host: {}, Latency: {}ms, Avg Latency: {:.2}ms",
-                host, latency.as_millis(), entry.average_latency
-            );
-        }
-
-        // Wait 500ms before the next iteration
-        sleep(Duration::from_millis(500)).await;
-    }
+fn create_ping_future(host: String, pinger: Pinger, delay: u64) -> BoxFuture<'static, PingResult> {
+    Box::pin(async move {
+        sleep(Duration::from_millis(delay)).await;
+        (host, pinger)
+    })
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let hosts = vec!["20.236.44.162", "142.250.75.142", "13.226.2.72"];
-    // let hosts = vec!["8.8.8.8"];
-    let stats = Arc::new(Mutex::new(HashMap::<String, LatencyStats>::new()));
+    let mut stats = HashMap::<String, LatencyStats>::new();
+    let mut futures: FuturesUnordered<BoxFuture<'static, PingResult>> = FuturesUnordered::new();
 
-    // Spawn a task for each host to monitor its latency
+    // Initialize stats and create initial futures
     for host in hosts {
-        let stats = Arc::clone(&stats);
-        tokio::spawn(monitor_host(host.to_string(), stats));
+        stats.insert(host.to_string(), LatencyStats::new());
+        
+        // Random initial delay
+        let delay = rand::thread_rng().gen_range(0..500);
+        let pinger = Pinger::new().await.unwrap();
+        let host = host.to_string();
+        
+        futures.push(create_ping_future(host, pinger, delay));
     }
 
-    // Wait for Ctrl-C or SIGTERM to exit
-    signal::ctrl_c()
-        .await
-        .expect("Failed to listen for Ctrl+C");
-    println!("Exiting...");
+    loop {
+        tokio::select! {
+            Some((host, pinger)) = futures.next() => {
+                // Start the ping
+                if let Some(latency) = ping_host(&pinger, &host).await {
+                    // Update stats
+                    if let Some(stats_entry) = stats.get_mut(&host) {
+                        stats_entry.update(latency.as_millis());
+                        
+                        println!(
+                            "Host: {}, Latency: {}ms, Avg Latency: {:.2}ms",
+                            host, latency.as_millis(), stats_entry.average_latency
+                        );
+                    }
+                }
+
+                // Schedule next ping for this host
+                futures.push(create_ping_future(host, pinger, 500));
+            }
+            
+            _ = signal::ctrl_c() => {
+                println!("Exiting...");
+                break;
+            }
+        }
+    }
 }
